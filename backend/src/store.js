@@ -153,7 +153,9 @@ const supabaseRequest = async (config, search, options = {}) => {
     }
     throw error;
   }
-  return response.status === 204 ? null : response.json();
+  if (response.status === 204 || options.headers?.Prefer?.includes('return=minimal')) return null;
+  const body = await response.text();
+  return body ? JSON.parse(body) : null;
 };
 
 const readSupabaseRecords = async (config, kind) => {

@@ -34,7 +34,7 @@ globalThis.fetch = async (request, options = {}) => {
       }
       records.set(row.id, row);
     }
-    return new Response(null, { status: 204 });
+    return new Response(null, { status: 201 });
   }
   if (method === 'DELETE') {
     const id = url.searchParams.get('id')?.replace(/^eq\./, '');
