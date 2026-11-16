@@ -22,7 +22,7 @@ test('registers accounts with hashed passwords and expiring revocable sessions',
   assert.equal(registered.user.email, 'officer@example.test');
   assert.ok(!('passwordHash' in registered.user));
   assert.ok(!('passwordSalt' in registered.user));
-  assert.equal(getSessionUser(registered.sessionToken).id, registered.user.id);
+  assert.equal((await getSessionUser(registered.sessionToken)).id, registered.user.id);
 
   const authenticated = await loginAccount({
     email: 'OFFICER@example.test',
@@ -34,8 +34,8 @@ test('registers accounts with hashed passwords and expiring revocable sessions',
     password: 'incorrect-password',
   }), /incorrect/);
 
-  destroySession(authenticated.sessionToken);
-  assert.equal(getSessionUser(authenticated.sessionToken), null);
+  await destroySession(authenticated.sessionToken);
+  assert.equal(await getSessionUser(authenticated.sessionToken), null);
 });
 
 test('rejects invalid registration and incorrect credentials', async () => {

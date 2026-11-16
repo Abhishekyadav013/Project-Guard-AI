@@ -14,13 +14,15 @@ ProjectGuard AI is a student-friendly construction project monitoring prototype 
 - Backend-validated progress updates, recalculated risk, structured risk drivers, and deduplicated open alerts.
 - CSV/JSON import preview with row-level validation, duplicate-ID checks, warnings, and valid-row import.
 - Downloadable CSV template and safe restoration of missing synthetic demo records.
-- JSON file persistence with atomic writes and backward-compatible project normalization.
+- Local JSON file persistence with atomic writes and backward-compatible project normalization.
+- Supabase PostgreSQL persistence for Vercel deployments.
 
 ## Technology
 
 - Frontend: React 18, Vite, JavaScript/JSX, CSS, Fetch API.
 - Backend: Node.js ES modules, Express, CORS.
-- Storage: `backend/data/store.json`.
+- Local storage: `backend/data/store.json`.
+- Hosted storage: Supabase PostgreSQL through the server-side REST API.
 - No added runtime framework or third-party dependency is needed for the listed features.
 
 ## Folder structure
@@ -28,6 +30,7 @@ ProjectGuard AI is a student-friendly construction project monitoring prototype 
 ```text
 backend/
   data/store.json
+  supabase/schema.sql
   src/
     authService.js
     importService.js
@@ -43,6 +46,8 @@ frontend/
     api.js
     styles.css
 ```
+
+Vercel's service/rewrite configuration is in `vercel.json`.
 
 ## Run locally
 
@@ -64,9 +69,22 @@ Open [http://localhost:5173](http://localhost:5173). The API listens at [http://
 
 To keep data somewhere else, start the backend with `PROJECTGUARD_DATA_FILE=/absolute/path/store.json`. The parent directory is created if needed. Do not point multiple backend processes at the same JSON file; JSON storage is for a single local prototype process.
 
+## Configure persistent storage on Vercel
+
+Vercel's function filesystem is not a persistent data store. For hosted accounts and project changes, configure Supabase before using the live app:
+
+1. Create a Supabase project.
+2. In its SQL Editor, run [`backend/supabase/schema.sql`](backend/supabase/schema.sql).
+3. In the Vercel project settings, add these environment variables for Production (and Preview if needed):
+   - `SUPABASE_URL`: the Supabase project's API URL.
+   - `SUPABASE_SERVICE_ROLE_KEY`: the server-only service role key from the Supabase API settings.
+4. Redeploy the Vercel project.
+
+Keep the service role key private: add it only as a Vercel server-side environment variable. Never put it in frontend environment variables, source control, or browser code. When deployed on Vercel without both variables, the API returns a configuration error rather than attempting to write under the deployed app directory. Local development continues to use the JSON file unless both Supabase variables are configured.
+
 ## Authentication limitations
 
-Registration and login are demo account features, not government authentication. Passwords are stored as salted scrypt hashes; the browser receives an HttpOnly, SameSite session cookie whose token is stored hashed in the JSON file. Sessions expire after 12 hours. There is no email verification, password reset, account recovery, role authorization, rate limiting, or per-user project isolation. Do not use this prototype to protect production or sensitive data.
+Registration and login are demo account features, not government authentication. Passwords are stored as salted scrypt hashes; the browser receives an HttpOnly, SameSite session cookie whose token is stored hashed in the configured data store. Sessions expire after 12 hours. There is no email verification, password reset, account recovery, role authorization, rate limiting, or per-user project isolation. Do not use this prototype to protect sensitive data.
 
 ## Project data and CSV/JSON import
 
@@ -129,4 +147,4 @@ Backend tests cover project validation, import parsing/validation, data quality,
 
 ## Limitations and future ML
 
-The project is a local prototype using a single JSON file. It has no live PAIMANA/source-system integration, official project data, trained ML model, production identity service, or authenticated user-specific portfolio. ML integration is a future enhancement requiring authorized historical project data, defined labels, evaluation, and validation; no model is represented as currently deployed.
+The project has no live PAIMANA/source-system integration, official project data, trained ML model, production identity service, or authenticated user-specific portfolio. ML integration is a future enhancement requiring authorized historical project data, defined labels, evaluation, and validation; no model is represented as currently deployed.

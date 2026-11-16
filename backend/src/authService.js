@@ -1,6 +1,6 @@
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'crypto';
 import { promisify } from 'util';
-import { readData, saveData } from './store.js';
+import { readData, removeSession, saveData } from './store.js';
 
 const scrypt = promisify(scryptCallback);
 export const SESSION_COOKIE = 'projectguard_session';
@@ -23,13 +23,13 @@ export async function registerAccount({ name, email, password }) {
     throw authError('Password must be between 8 and 128 characters.', 400);
   }
 
-  let data = readData();
+  let data = await readData();
   if (data.users.some((user) => user.email === cleanEmail)) {
     throw authError('An account with this email already exists.', 409);
   }
   const salt = randomBytes(16).toString('hex');
   const passwordHash = (await scrypt(password, salt, 64)).toString('hex');
-  data = readData();
+  data = await readData();
   if (data.users.some((existingUser) => existingUser.email === cleanEmail)) {
     throw authError('An account with this email already exists.', 409);
   }
@@ -41,14 +41,21 @@ export async function registerAccount({ name, email, password }) {
     passwordHash,
     createdAt: new Date().toISOString(),
   };
-  data.users.push(user);
-  const sessionToken = await createSession(data, user.id);
+  try {
+    await saveData({ users: [user] });
+  } catch (error) {
+    if (error.code === '23505' || error.message.includes('projectguard_records_user_email_unique')) {
+      throw authError('An account with this email already exists.', 409);
+    }
+    throw error;
+  }
+  const sessionToken = await createSession(user.id);
   return { user: publicUser(user), sessionToken };
 }
 
 export async function loginAccount({ email, password }) {
   const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  const data = readData();
+  const data = await readData();
   const user = data.users.find((item) => item.email === cleanEmail);
   if (!user || typeof password !== 'string') throw authError('Email or password is incorrect.', 401);
 
@@ -58,30 +65,29 @@ export async function loginAccount({ email, password }) {
   if (candidateBuffer.length !== storedBuffer.length || !timingSafeEqual(candidateBuffer, storedBuffer)) {
     throw authError('Email or password is incorrect.', 401);
   }
-  const currentData = readData();
+  const currentData = await readData();
   if (!currentData.users.some((currentUser) => currentUser.id === user.id)) {
     throw authError('Email or password is incorrect.', 401);
   }
-  const sessionToken = await createSession(currentData, user.id);
+  const sessionToken = await createSession(user.id);
   return { user: publicUser(user), sessionToken };
 }
 
-const createSession = async (data, userId) => {
+const createSession = async (userId) => {
   const sessionToken = randomBytes(32).toString('base64url');
   const now = Date.now();
-  data.sessions = data.sessions.filter((session) => new Date(session.expiresAt).getTime() > now);
-  data.sessions.push({
+  const session = {
     tokenHash: hashToken(sessionToken),
     userId,
     expiresAt: new Date(now + SESSION_MAX_AGE_SECONDS * 1000).toISOString(),
-  });
-  saveData(data);
+  };
+  await saveData({ sessions: [session] });
   return sessionToken;
 };
 
-export function getSessionUser(sessionToken) {
+export async function getSessionUser(sessionToken) {
   if (typeof sessionToken !== 'string' || !sessionToken) return null;
-  const data = readData();
+  const data = await readData();
   const tokenHash = hashToken(sessionToken);
   const session = data.sessions.find((item) => {
     const storedHash = Buffer.from(item.tokenHash, 'hex');
@@ -93,10 +99,7 @@ export function getSessionUser(sessionToken) {
   return user ? publicUser(user) : null;
 }
 
-export function destroySession(sessionToken) {
+export async function destroySession(sessionToken) {
   if (typeof sessionToken !== 'string' || !sessionToken) return;
-  const data = readData();
-  const tokenHash = hashToken(sessionToken);
-  data.sessions = data.sessions.filter((session) => session.tokenHash !== tokenHash);
-  saveData(data);
+  await removeSession(hashToken(sessionToken));
 }

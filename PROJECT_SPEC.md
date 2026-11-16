@@ -24,8 +24,8 @@ React/Vite dashboard
 Express API + session checks
     ↓
 Project validation / import service / rule-based risk engine
-    ↓
-Atomic local JSON persistence
+    ↓                         ↓
+Local atomic JSON store       Supabase PostgreSQL on Vercel
 ```
 
 No separate ML service or external project data integration is connected.
@@ -86,9 +86,11 @@ Authenticated: `GET /api/dashboard`, `GET /api/insights`, `GET /api/projects`, `
 
 ## Persistence
 
-`backend/data/store.json` stores projects, alerts, demo users, and hashed session records. Writes use temporary files plus rename. Existing project/alert records are normalized when read; malformed JSON or invalid top-level structure causes an explicit error and is not silently replaced. `PROJECTGUARD_DATA_FILE` can select an alternate absolute path for local tests or demos.
+Local development stores projects, alerts, demo users, and hashed session records in `backend/data/store.json`. Writes use temporary files plus rename. Existing project/alert records are normalized when read; malformed JSON or invalid top-level structure causes an explicit error and is not silently replaced. `PROJECTGUARD_DATA_FILE` can select an alternate absolute path for local tests or demos.
 
-This JSON store is for a single local prototype process, not concurrent production deployment.
+Vercel uses the Supabase table defined in `backend/supabase/schema.sql`. Configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` as server-side environment variables in Vercel; the service role key must never be exposed to the frontend. Hosted requests fail explicitly if storage is not configured instead of writing to Vercel's temporary function filesystem. Local development continues to use JSON unless both Supabase variables are set.
+
+The local JSON store is for a single prototype process, not concurrent production deployment. Supabase provides durable persistence but does not add production identity features or per-user data isolation.
 
 ## Run and validate
 
@@ -113,5 +115,5 @@ cd frontend && npm run build
 - No trained/evaluated ML predictor.
 - Demo users share data and roles are UI-only.
 - No production-grade authentication controls (rate limiting, account verification/recovery, authorization policy).
-- JSON file storage is not a concurrent multi-instance database.
+- Local JSON storage is not a concurrent multi-instance database.
 - Risk thresholds and weights need domain validation before operational decisions.

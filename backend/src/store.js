@@ -7,6 +7,8 @@ import { getDataQuality, validateProject } from './projectData.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataFile = process.env.PROJECTGUARD_DATA_FILE || path.join(__dirname, '..', 'data', 'store.json');
 const dataDir = path.dirname(dataFile);
+const SUPABASE_TABLE = 'projectguard_records';
+const SUPABASE_BATCH_SIZE = 100;
 const makeId = (prefix = 'id') => `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
 const demoNames = [
@@ -117,6 +119,97 @@ const writeFileAtomically = (payload) => {
   fs.renameSync(temporaryFile, dataFile);
 };
 
+const getSupabaseConfig = () => {
+  const url = process.env.SUPABASE_URL?.trim();
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  if (url && key) return { url: url.replace(/\/+$/, ''), key };
+  if (url || key || process.env.VERCEL === '1') {
+    const error = new Error('Persistent storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.');
+    error.status = 503;
+    throw error;
+  }
+  return null;
+};
+
+const supabaseRequest = async (config, search, options = {}) => {
+  const response = await fetch(`${config.url}/rest/v1/${SUPABASE_TABLE}${search}`, {
+    ...options,
+    headers: {
+      apikey: config.key,
+      Authorization: `Bearer ${config.key}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    const error = new Error(`Supabase storage request failed (${response.status}): ${detail}`);
+    error.status = 502;
+    try {
+      error.code = JSON.parse(detail).code;
+    } catch {
+      error.code = undefined;
+    }
+    throw error;
+  }
+  return response.status === 204 ? null : response.json();
+};
+
+const readSupabaseRecords = async (config, kind) => {
+  const records = [];
+  for (let offset = 0; ; offset += 1000) {
+    const rows = await supabaseRequest(
+      config,
+      `?kind=eq.${kind}&select=id,data&order=id.asc`,
+      { headers: { Range: `${offset}-${offset + 999}` } },
+    );
+    records.push(...rows.map((row) => row.data));
+    if (rows.length < 1000) return records;
+  }
+};
+
+const upsertSupabaseRecords = async (config, kind, records) => {
+  for (let offset = 0; offset < records.length; offset += SUPABASE_BATCH_SIZE) {
+    const rows = records.slice(offset, offset + SUPABASE_BATCH_SIZE).map((data) => ({
+      id: kind === 'session' ? data.tokenHash : data.id,
+      kind,
+      data,
+    }));
+    await supabaseRequest(config, '?on_conflict=id', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(rows),
+    });
+  }
+};
+
+const saveSupabaseData = async (config, data) => {
+  for (const [kind, records] of [
+    ['project', data.projects],
+    ['alert', data.alerts],
+    ['user', data.users],
+    ['session', data.sessions],
+  ]) {
+    if (records) await upsertSupabaseRecords(config, kind, records);
+  }
+};
+
+export const removeSession = async (tokenHash) => {
+  const config = getSupabaseConfig();
+  if (config) {
+    await supabaseRequest(config, `?id=eq.${encodeURIComponent(tokenHash)}&kind=eq.session`, {
+      method: 'DELETE',
+      headers: { Prefer: 'return=minimal' },
+    });
+    return;
+  }
+  ensureStore();
+  const data = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+  data.sessions = data.sessions.filter((session) => session.tokenHash !== tokenHash);
+  writeFileAtomically(data);
+};
+
 const ensureStore = () => {
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
@@ -182,7 +275,7 @@ const ensureStore = () => {
   }
 };
 
-export const readData = () => {
+const readLocalData = () => {
   ensureStore();
   const parsed = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
   const projects = parsed.projects.map((project) => withRiskSummary(project));
@@ -194,42 +287,92 @@ export const readData = () => {
   };
 };
 
-export const saveData = (data) => {
+const readSupabaseData = async (config) => {
+  const [storedProjects, storedAlerts, users, sessions] = await Promise.all([
+    readSupabaseRecords(config, 'project'),
+    readSupabaseRecords(config, 'alert'),
+    readSupabaseRecords(config, 'user'),
+    readSupabaseRecords(config, 'session'),
+  ]);
+  const existingDemoIds = new Set(storedProjects.map((project) => project.id));
+  const addedDemoProjects = createSeedProjects().filter((project) => !existingDemoIds.has(project.id));
+  const projects = storedProjects.map((project) => {
+    const { project: normalized } = validateProject(project);
+    return withRiskSummary({ ...normalized, ...project, dataOrigin: project.dataOrigin || 'Demo / Synthetic Data' });
+  });
+  projects.push(...addedDemoProjects);
+  let alerts = storedAlerts;
+  if (!storedProjects.length || addedDemoProjects.length) {
+    const seedProjects = !storedProjects.length ? projects : addedDemoProjects;
+    const seedAlerts = seedProjects
+      .filter((project) => project.riskScore >= 31)
+      .map((project) => ({
+        id: `demo-alert-${project.id}`,
+        projectId: project.id,
+        projectName: project.name,
+        level: project.riskLevel,
+        score: project.riskScore,
+        title: `${project.riskLevel} risk review: ${project.name}`,
+        message: project.riskDrivers.map((item) => item.message).join(' '),
+        recommendedReview: project.recommendedReview,
+        date: project.updatedAt,
+        read: false,
+      }));
+    alerts = [...seedAlerts, ...storedAlerts];
+  }
+  if (!storedProjects.length || addedDemoProjects.length) {
+    await saveSupabaseData(config, { projects, alerts });
+  }
+  return { projects, alerts, users, sessions };
+};
+
+export const readData = async () => {
+  const config = getSupabaseConfig();
+  return config ? readSupabaseData(config) : readLocalData();
+};
+
+export const saveData = async (data) => {
+  const config = getSupabaseConfig();
+  if (config) return saveSupabaseData(config, data);
   let existing = { users: [], sessions: [] };
   if (fs.existsSync(dataFile)) {
     existing = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
   }
+  const mergeById = (current = [], updates = [], getId = (record) => record.id) => {
+    const records = new Map(current.map((record) => [getId(record), record]));
+    for (const record of updates) records.set(getId(record), record);
+    return [...records.values()];
+  };
   writeFileAtomically({
-    projects: data.projects ?? existing.projects ?? [],
-    alerts: data.alerts ?? existing.alerts ?? [],
-    users: data.users ?? existing.users ?? [],
-    sessions: data.sessions ?? existing.sessions ?? [],
+    projects: mergeById(existing.projects, data.projects),
+    alerts: mergeById(existing.alerts, data.alerts),
+    users: mergeById(existing.users, data.users),
+    sessions: mergeById(existing.sessions, data.sessions, (session) => session.tokenHash),
   });
 };
 
-export const listProjects = () => {
-  const { projects } = readData();
+export const listProjects = async () => {
+  const { projects } = await readData();
   return [...projects].sort((a, b) => b.riskScore - a.riskScore);
 };
 
-export const getProjectById = (projectId) => readData().projects.find((project) => project.id === projectId) || null;
+export const getProjectById = async (projectId) => (await readData()).projects.find((project) => project.id === projectId) || null;
 
-export const listAlerts = () => {
-  const { alerts } = readData();
+export const listAlerts = async () => {
+  const { alerts } = await readData();
   return [...alerts].sort((a, b) => new Date(b.date) - new Date(a.date));
 };
 
-export const markAlertRead = (alertId) => {
-  const { projects, alerts } = readData();
+export const markAlertRead = async (alertId) => {
+  const { alerts } = await readData();
   const alert = alerts.find((item) => item.id === alertId);
   if (!alert) return null;
   alert.read = true;
-  saveData({ projects, alerts });
+  await saveData({ alerts: [alert] });
   return alert;
 };
 
-export const createProjectRecord = (projectInput) => {
-  const { projects, alerts } = readData();
+export const createProjectRecord = async (projectInput) => {
   const now = new Date().toISOString();
   const { project: normalized } = validateProject(projectInput);
   const actualProgress = Number(normalized.actualProgress ?? 0);
@@ -249,13 +392,11 @@ export const createProjectRecord = (projectInput) => {
       note: normalized.remarks || 'Initial project baseline recorded in the demo workspace.',
     }],
   });
-  projects.unshift(project);
-  saveData({ projects, alerts });
+  await saveData({ projects: [project] });
   return project;
 };
 
-export const importProjectRecords = (incomingProjects) => {
-  const { projects, alerts } = readData();
+export const importProjectRecords = async (incomingProjects) => {
   const created = incomingProjects.map((input) => {
     const now = new Date().toISOString();
     const { project: normalized } = validateProject(input, { requireImportFields: true });
@@ -276,7 +417,7 @@ export const importProjectRecords = (incomingProjects) => {
     });
     return imported;
   });
-  projects.unshift(...created);
+  const alerts = [];
   for (const project of created.filter((item) => item.riskLevel !== 'Low')) {
     alerts.unshift({
       id: makeId('alert'),
@@ -291,15 +432,15 @@ export const importProjectRecords = (incomingProjects) => {
       read: false,
     });
   }
-  saveData({ projects, alerts });
+  await saveData({ projects: created, alerts });
   return created;
 };
 
-export const restoreDemoProjects = () => {
-  const { projects, alerts } = readData();
+export const restoreDemoProjects = async () => {
+  const { projects } = await readData();
   const existingIds = new Set(projects.map((project) => project.id));
   const restored = createSeedProjects().filter((project) => !existingIds.has(project.id));
-  projects.push(...restored);
+  const alerts = [];
   for (const project of restored.filter((item) => item.riskLevel !== 'Low')) {
     alerts.unshift({
       id: makeId('alert'),
@@ -314,16 +455,17 @@ export const restoreDemoProjects = () => {
       read: false,
     });
   }
-  saveData({ projects, alerts });
-  return { restored: restored.length, total: projects.length };
+  await saveData({ projects: restored, alerts });
+  return { restored: restored.length, total: projects.length + restored.length };
 };
 
-export const upsertProjectAlert = (project) => {
-  const { projects, alerts } = readData();
+export const upsertProjectAlert = async (project) => {
+  const { alerts } = await readData();
   const existingIndex = alerts.findIndex((alert) => alert.projectId === project.id && !alert.read);
   if (project.riskLevel === 'Low') {
-    if (existingIndex >= 0) alerts[existingIndex].read = true;
-    saveData({ projects, alerts });
+    if (existingIndex < 0) return null;
+    alerts[existingIndex].read = true;
+    await saveData({ alerts: [alerts[existingIndex]] });
     return null;
   }
   const payload = {
@@ -343,8 +485,7 @@ export const upsertProjectAlert = (project) => {
     alerts[existingIndex] = alert;
   } else {
     alert = { id: makeId('alert'), ...payload };
-    alerts.unshift(alert);
   }
-  saveData({ projects, alerts });
+  await saveData({ alerts: [alert] });
   return alert;
 };
